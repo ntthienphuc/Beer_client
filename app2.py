@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-app.py — Beer-Manager (Raspberry Pi Edition) 🏝
-GUI with three tabs:
-  1. ORDER   – live bill with camera / GPIO trigger
-  2. ADMIN   – edit menu items & prices
-  3. HISTORY – browse exported CSV bills
+app.py — Beer-Manager (Raspberry Pi Edition)  🏝
 
-Changes in this version
-──────────────────────────────────────────────────────────
-✓ Works on Raspberry Pi OS (Bookworm) that uses *libcamera*
-  • `capture_frame()` takes a picture via OpenCV if possible,
-    otherwise falls back to `libcamera-still`.
+Complete, one-file GUI application that
 
-✓ Robust GPIO handling
-  • Many optical fork sensors pull the line **LOW** when blocked.
-    `gpiozero.Button(..., pull_up=True, active_state=False)` now
-    interprets “beam blocked” as **pressed**.
+  • Lists menu items, edits prices (ADMIN tab)
+  • Opens a session and builds a bill (ORDER tab)
+    – A can blocking the IR sensor on GPIO-17 triggers a photo
+      → TFLite classification → quantity increment
+    – Manual “Upload Beer Image” button does the same from a file
+  • Browses previous CSV bills (HISTORY tab)
 
-✓ Thread-safe one-shot classification
-  • `_capture_and_predict()` guarantees one capture at a time and
-    hands the classified beer name back to the Tk thread.
+This version adds **detailed logging** around the sensor / capture flow:
+
+  – INFO:  beam blocked, capture start, classified name, busy-camera skips
+  – DEBUG: chosen capture backend (OpenCV vs libcamera), etc.
+
+Change log level at the top of the file:
+
+    logging.basicConfig(level=logging.INFO, …)     # INFO and above
+    logging.basicConfig(level=logging.DEBUG, …)    # show DEBUG too
 """
 
-# ───────────────────────────── Imports ───────────────────────────
 from __future__ import annotations
 
+# ────────────────────── Standard Library ────────────────────────
 import csv
 import datetime as dt
 import logging
@@ -36,8 +36,11 @@ import threading
 import uuid
 from pathlib import Path
 
+# ───────────────────────── 3rd-Party ────────────────────────────
 import cv2
 import numpy as np
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
 from ttkbootstrap import Style, ttk
 from ttkbootstrap.constants import *
 
@@ -52,167 +55,153 @@ from utils.csv_utils import (
     save_menu_rows,
 )
 
-# Optional GPIO; still works on Windows for UI testing
+# GPIO (present only on Pi)
 try:
     from gpiozero import Button
     from gpiozero.pins.gpiochip import GPIOChipPinFactory
 
     GPIO_AVAILABLE = True
-except ImportError:  # running on a non-Pi machine
+except ImportError:  # developing on PC / Mac
     GPIO_AVAILABLE = False
 
-# ─────────────────────────── Configuration ───────────────────────
-GPIO_PIN = 17                   # BCM number (physical pin-11)
-GPIO_BOUNCE_TIME = 0.3          # seconds; one trigger per can
+# ─────────────────────── Configuration ──────────────────────────
+GPIO_PIN = 17                   # BCM pin number
+GPIO_BOUNCE_TIME = 0.3          # seconds; one event per can
 
 MENU_FILE = "data/menu.csv"
 MODEL_FILE = "best.tflite"
 BILLS_DIR = Path("data/bills")
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,         # switch to DEBUG for more detail
     format="%(asctime)s  %(levelname)8s — %(message)s",
 )
 
-# ───────────────────────────── GUI Root ──────────────────────────
+# ────────────────────── Load TFLite model ───────────────────────
+if not os.path.isfile(MODEL_FILE):
+    raise FileNotFoundError(f"Model not found: {MODEL_FILE}")
+model = TFLiteModel(MODEL_FILE)
+logging.info("TFLite model loaded from %s", MODEL_FILE)
+
+# ────────────────────────── Tk root ─────────────────────────────
 style = Style(theme="litera")
 root = style.master
 root.title("🍺 Beer Manager")
 
 table_id_var = ttk.IntVar(master=root, value=1)
 
-# ────────────────────────── Load TFLite Model ────────────────────
-if not os.path.isfile(MODEL_FILE):
-    raise FileNotFoundError(f"Model not found: {MODEL_FILE}")
-model = TFLiteModel(MODEL_FILE)
-
-# ──────────────────── Notebook Skeleton (3 Tabs) ─────────────────
+# ──────────────────────── Notebook ──────────────────────────────
 nb = ttk.Notebook(root)
-order_frame = ttk.Frame(nb)
-admin_frame = ttk.Frame(nb)
+order_frame   = ttk.Frame(nb)
+admin_frame   = ttk.Frame(nb)
 history_frame = ttk.Frame(nb)
-nb.add(order_frame, text="📝 ORDER")
-nb.add(admin_frame, text="🔧 ADMIN")
+nb.add(order_frame,  text="📝 ORDER")
+nb.add(admin_frame,  text="🔧 ADMIN")
 nb.add(history_frame, text="📜 HISTORY")
 nb.pack(fill=BOTH, expand=True)
 
-# ───────────────────── Helper Utilities ──────────────────────────
-cap_lock = threading.Lock()  # ensures one camera access at a time
+# ───────────────────── Helper Utilities ─────────────────────────
+cap_lock = threading.Lock()  # ensure single concurrent capture
 
 
 def read_image_unicode(path: str) -> np.ndarray | None:
-    """Read an image whose path may contain non-ASCII characters."""
+    """Open image even if the path contains non-ASCII characters."""
     try:
         data = np.fromfile(path, dtype=np.uint8)
         return cv2.imdecode(data, cv2.IMREAD_COLOR)
-    except Exception:
+    except Exception as exc:
+        logging.error("Failed to read %s: %s", path, exc)
         return None
 
 
 def add_tree_scroll(tree: ttk.Treeview, container: ttk.Frame, side=RIGHT) -> None:
-    """Attach a vertical scrollbar to a Treeview widget."""
     vsb = ttk.Scrollbar(container, orient=VERTICAL, command=tree.yview)
     tree.configure(yscrollcommand=vsb.set)
     vsb.pack(side=side, fill=Y)
 
 
-# ───────────────────── Robust Camera Capture ─────────────────────
+# ───────────────── Camera Capture (with fallback) ───────────────
 def capture_frame() -> np.ndarray | None:
     """
-    Grab one frame.
-
-    1. Try OpenCV/V4L2 (works for USB webcams).
-    2. Fall back to `libcamera-still` (works for the Pi Camera
-       on Bookworm and later).
-
-    Returns
-    -------
-    np.ndarray | None
-        BGR image or None on failure.
+    Returns one BGR frame or None.
+    Tries OpenCV/V4L2 first; falls back to libcamera-still.
     """
-    # –– Attempt 1: OpenCV ––––––––––––––––––––––––––––––––––––––––
+    # Attempt 1: OpenCV (works for USB webcams and legacy driver)
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
     if cap.isOpened():
         ok, frame = cap.read()
         cap.release()
         if ok:
-            logging.debug("Captured frame via OpenCV.")
+            logging.debug("Frame captured via OpenCV/V4L2")
             return frame
 
-    # –– Attempt 2: libcamera ––––––––––––––––––––––––––––––––––––––
-    tmp_path = Path(tempfile.gettempdir()) / f"{uuid.uuid4()}.jpg"
+    # Attempt 2: libcamera-still (works on Pi Camera with Bookworm)
+    tmp = Path(tempfile.gettempdir()) / f"{uuid.uuid4()}.jpg"
     try:
         subprocess.run(
             [
                 "libcamera-still",
-                "-o",
-                str(tmp_path),
-                "--width",
-                "640",
-                "--height",
-                "480",
-                "-t",
-                "200",  # 200 ms exposure
-                "--nopreview",
-                "--flush",
-                "--autowb",
+                "-o", str(tmp),
+                "--width", "640", "--height", "480",
+                "-t", "200", "--nopreview", "--flush", "--autowb",
             ],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        img = cv2.imread(str(tmp_path))
+        img = cv2.imread(str(tmp))
         if img is not None:
-            logging.debug("Captured frame via libcamera-still.")
+            logging.debug("Frame captured via libcamera-still")
         return img
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        logging.exception("Camera capture failed: %s", exc)
+        logging.exception("Capture failed: %s", exc)
         return None
     finally:
-        tmp_path.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
 
 
-# ───────────────── One-Shot Capture + Predict ────────────────────
-def _capture_and_predict(add_fn) -> None:
+# ─────────────── One-shot Capture + Classification ──────────────
+def _capture_and_predict(add_fn):
     """
-    Take one photo, classify it, and call `add_fn(name)` on the Tk thread.
-    Designed to run in a background thread; returns immediately.
+    Background thread: capture → classify → schedule GUI update.
     """
     if not cap_lock.acquire(blocking=False):
-        return  # camera already busy
+        logging.info("Sensor triggered but camera is busy – skipped")
+        return
     try:
+        logging.info("Starting capture…")
         frame = capture_frame()
         if frame is None:
+            logging.warning("No frame captured – skipped")
             return
 
         name = model.predict(frame)
-        logging.info("Classified: %s", name)
         if name == UNKNOWN_NAME:
-            return  # confidence below threshold — ignore
+            logging.info("Low-confidence result – ignored")
+            return
 
-        # Schedule GUI update on the main thread
+        logging.info("✅ Classified: %s", name)
         root.after(0, lambda: add_fn(name))
     finally:
         if cap_lock.locked():
             cap_lock.release()
 
 
-# ────────────────────────── ORDER TAB ────────────────────────────
+# ───────────────────────── ORDER TAB ────────────────────────────
 order_state: dict[str, object] = {"active": False}
-gpio_btn: Button | None = None  # will be initialised on first ORDER tab open
+gpio_btn: Button | None = None  # initialised on first tab entry
 
 
 def start_session() -> None:
     """Begin a new bill for the selected table."""
     menu = load_menu()
     if not menu:
-        messagebox.showwarning("Empty menu", "Please add items in ADMIN.", parent=root)
+        messagebox.showwarning("Empty menu", "Add items in ADMIN first.", parent=root)
         return
 
     now = dt.datetime.now()
     tmp = init_bill(table_id_var.get(), "tmp")
     bill = tmp.with_name(f"bill_{table_id_var.get()}_{now:%H-%M}_{now:%d-%m-%Y}.csv")
-
     try:
         os.rename(tmp, bill)
     except FileExistsError:
@@ -233,7 +222,7 @@ def finish_session() -> None:
     end = dt.datetime.now().strftime("%H-%M")
     bill: Path = order_state["bill"]  # type: ignore
     parts = bill.stem.split("_")
-    if len(parts) == 4:  # append end-time only once
+    if len(parts) == 4:  # only add end-time once
         bill.rename(bill.with_name("_".join(parts[:3] + [end] + parts[3:]) + bill.suffix))
 
     messagebox.showinfo("Session finished", f"Bill saved:\n{bill}", parent=root)
@@ -243,36 +232,31 @@ def finish_session() -> None:
 
 
 def build_order() -> None:
-    """Redraw the ORDER tab; called on tab switch and state changes."""
+    """Redraw the ORDER tab."""
     global gpio_btn
     fr = order_frame
-    for widget in fr.winfo_children():
-        widget.destroy()
+    for w in fr.winfo_children():
+        w.destroy()
 
-    # –– No active session ––––––––––––––––––––––––––––––––––––––––
+    # ——— No active session ————————————————————————————
     if not order_state["active"]:
         ttk.Button(
-            fr,
-            text="🚀  Start Session",
-            width=20,
-            bootstyle="success",
-            padding=10,
-            command=start_session,
+            fr, text="🚀  Start Session", width=20, bootstyle="success",
+            padding=10, command=start_session,
         ).pack(pady=80)
         if gpio_btn:
             gpio_btn.close()
             gpio_btn = None
         return
 
-    # –– Active session –––––––––––––––––––––––––––––––––––––––––––
+    # ——— Active session ————————————————————————————————
     menu: dict[str, float] = order_state["menu"]  # type: ignore
     qtys: dict[str, int] = order_state["qtys"]  # type: ignore
-    bill: Path = order_state["bill"]  # type: ignore
-    start_str: str = order_state["start"]  # type: ignore
+    bill: Path = order_state["bill"]            # type: ignore
+    start_str: str = order_state["start"]       # type: ignore
 
     ttk.Label(
-        fr,
-        text=f"Table {table_id_var.get()} • Started {start_str}",
+        fr, text=f"Table {table_id_var.get()} • Started {start_str}",
         font=("Segoe UI Semibold", 18),
         bootstyle="inverse-primary",
         padding=10,
@@ -282,7 +266,7 @@ def build_order() -> None:
     style.configure("Treeview", rowheight=28, font=("Segoe UI", 11))
     style.configure("Treeview.Heading", font=("Segoe UI Semibold", 12))
 
-    # ── Left Pane — Item List ─────────────────────────────────────
+    # Left pane — menu item list
     left = ttk.Frame(fr)
     left.pack(side=LEFT, fill=BOTH, expand=True, padx=(10, 0), pady=10)
     cols = ("name", "qty", "price")
@@ -295,7 +279,7 @@ def build_order() -> None:
     tree.pack(side=LEFT, fill=BOTH, expand=True)
     add_tree_scroll(tree, left)
 
-    # ── Right Pane — Controls ────────────────────────────────────
+    # Right pane — controls
     ctrl = ttk.Frame(fr, padding=10)
     ctrl.pack(side=LEFT, fill=Y, padx=10, pady=10)
 
@@ -306,88 +290,91 @@ def build_order() -> None:
 
     update_total()
     ttk.Label(
-        ctrl,
-        textvariable=total_var,
-        font=("Segoe UI Semibold", 14),
-        bootstyle="primary",
-        padding=(0, 0, 0, 10),
+        ctrl, textvariable=total_var, font=("Segoe UI Semibold", 14),
+        bootstyle="primary", padding=(0, 0, 0, 10)
     ).pack()
 
     # Quantity adjust list
     grp = ttk.LabelFrame(ctrl, text="Adjust Qty", bootstyle="secondary")
     grp.pack(fill=X, pady=(0, 10))
-
     canvas = tk.Canvas(grp, height=300, highlightthickness=0)
-    inner = ttk.Frame(canvas)
-    vsb = ttk.Scrollbar(grp, orient=VERTICAL, command=canvas.yview)
+    inner  = ttk.Frame(canvas)
+    vsb    = ttk.Scrollbar(grp, orient=VERTICAL, command=canvas.yview)
     canvas.configure(yscrollcommand=vsb.set)
     vsb.pack(side=RIGHT, fill=Y)
     canvas.pack(side=LEFT, fill=BOTH, expand=True)
     canvas.create_window((0, 0), window=inner, anchor="nw")
     inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
-    def add_item(name: str) -> None:
-        qtys[name] += 1
-        tree.set(name, "qty", qtys[name])
-        append_bill(bill, name, qtys[name], menu[name])
+    def add_item(n: str) -> None:
+        qtys[n] += 1
+        tree.set(n, "qty", qtys[n])
+        append_bill(bill, n, qtys[n], menu[n])
         update_total()
 
-    def sub_item(name: str) -> None:
-        if qtys[name] == 0:
+    def sub_item(n: str) -> None:
+        if qtys[n] == 0:
             return
-        qtys[name] -= 1
-        tree.set(name, "qty", qtys[name])
-        append_bill(bill, name, qtys[name], menu[name])
+        qtys[n] -= 1
+        tree.set(n, "qty", qtys[n])
+        append_bill(bill, n, qtys[n], menu[n])
         update_total()
 
-    for name in menu:
+    for n in menu:
         row = ttk.Frame(inner)
         row.pack(fill=X, pady=2)
-        ttk.Label(row, text=name, width=20).pack(side=LEFT)
-        ttk.Button(row, text="+", bootstyle="success", width=3, command=lambda n=name: add_item(n)).pack(
-            side=LEFT, padx=4
-        )
-        ttk.Button(row, text="-", bootstyle="danger", width=3, command=lambda n=name: sub_item(n)).pack(side=LEFT)
+        ttk.Label(row, text=n, width=20).pack(side=LEFT)
+        ttk.Button(row, text="+", bootstyle="success", width=3,
+                   command=lambda i=n: add_item(i)).pack(side=LEFT, padx=4)
+        ttk.Button(row, text="-", bootstyle="danger",  width=3,
+                   command=lambda i=n: sub_item(i)).pack(side=LEFT)
 
-    # Manual upload button (file dialog)
+    # Manual upload button
     def upload_image() -> None:
-        file_path = filedialog.askopenfilename(parent=root, filetypes=[("Images", "*.jpg *.jpeg *.png")])
-        if not file_path:
+        fpath = filedialog.askopenfilename(
+            parent=root, filetypes=[("Images", "*.jpg *.jpeg *.png")]
+        )
+        if not fpath:
             return
-        img = read_image_unicode(file_path)
+        img = read_image_unicode(fpath)
         if img is None:
-            messagebox.showerror("Error", f"Cannot read image:\n{file_path}", parent=root)
+            messagebox.showerror("Error", f"Cannot read image:\n{fpath}", parent=root)
             return
         name = model.predict(img)
         add_item(name)
         messagebox.showinfo("Added", name, parent=root)
 
-    ttk.Button(ctrl, text="📷 Upload Beer Image", width=20, bootstyle="info", command=upload_image).pack(
-        pady=(0, 10)
-    )
+    ttk.Button(ctrl, text="📷 Upload Beer Image", width=20,
+               bootstyle="info", command=upload_image).pack(pady=(0, 10))
 
-    ttk.Button(ctrl, text="✅ Finish Session", width=20, bootstyle="primary", command=finish_session).pack()
+    ttk.Button(ctrl, text="✅ Finish Session", width=20,
+               bootstyle="primary", command=finish_session).pack()
 
-    # ── GPIO Setup (one-time) ─────────────────────────────────────
+    # GPIO setup — run once
     if GPIO_AVAILABLE and gpio_btn is None:
         factory = GPIOChipPinFactory()
         gpio_btn = Button(
             GPIO_PIN,
-            pull_up=True,        # activate internal pull-up resistor
+            pull_up=True,            # sensor keeps line HIGH; LOW = blocked
             bounce_time=GPIO_BOUNCE_TIME,
             pin_factory=factory,
-            active_state=False,  # “pressed” when line is LOW (beam blocked)
+            active_state=False,      # pressed when line is LOW
         )
+        logging.info("GPIO pin %d initialised (active LOW)", GPIO_PIN)
 
-        def on_blocked() -> None:
-            threading.Thread(target=_capture_and_predict, args=(add_item,), daemon=True).start()
+        def on_blocked():
+            logging.info("📟  Beam blocked — sensor triggered")
+            threading.Thread(
+                target=_capture_and_predict,
+                args=(add_item,),
+                daemon=True
+            ).start()
 
         gpio_btn.when_pressed = on_blocked
 
 
-# ───────────────────────── ADMIN TAB ─────────────────────────────
+# ───────────────────────── ADMIN TAB ────────────────────────────
 def build_admin() -> None:
-    """Redraw the ADMIN tab."""
     f = admin_frame
     for w in f.winfo_children():
         w.destroy()
@@ -400,20 +387,17 @@ def build_admin() -> None:
     def refresh() -> None:
         tree.delete(*tree.get_children())
         for i, r in enumerate(rows, 1):
-            tree.insert("", "end", iid=str(i), values=(i, r["name"], f"{r['price']:.0f}"))
+            tree.insert("", "end", iid=str(i),
+                        values=(i, r["name"], f"{r['price']:.0f}"))
         save_menu_rows(rows)
 
     ttk.Label(
-        f,
-        text="⚙️ ADMIN PAGE",
-        font=("Segoe UI Semibold", 16),
-        bootstyle="inverse-info",
-        padding=10,
+        f, text="⚙️ ADMIN PAGE", font=("Segoe UI Semibold", 16),
+        bootstyle="inverse-info", padding=10
     ).pack(fill=X, padx=10, pady=(10, 5))
 
     tbl = ttk.Frame(f)
     tbl.pack(side=LEFT, fill=BOTH, expand=True, padx=(10, 0), pady=10)
-
     tree = ttk.Treeview(tbl, columns=("id", "name", "price"), show="headings")
     for cid, width in zip(("id", "name", "price"), (50, 220, 120)):
         tree.heading(cid, text=cid.upper())
@@ -429,7 +413,8 @@ def build_admin() -> None:
         n = simpledialog.askstring("Item name", "Enter new item name:", parent=root)
         if not n:
             return
-        p = simpledialog.askfloat("Price", f"Unit price for {n} (₫):", minvalue=0, parent=root)
+        p = simpledialog.askfloat("Price", f"Unit price for {n} (₫):",
+                                  minvalue=0, parent=root)
         if p is None:
             return
         rows.append({"name": n, "price": p})
@@ -438,12 +423,16 @@ def build_admin() -> None:
     def edit_price() -> None:
         sel = tree.selection()
         if not sel:
-            messagebox.showwarning("No selection", "Select one item first.", parent=root)
+            messagebox.showwarning("No selection", "Select an item first.", parent=root)
             return
         idx = int(sel[0]) - 1
         cur = rows[idx]
         new = simpledialog.askfloat(
-            "Edit price", f"New price for {cur['name']}:", initialvalue=cur["price"], minvalue=0, parent=root
+            "Edit price",
+            f"New price for {cur['name']}:",
+            initialvalue=cur["price"],
+            minvalue=0,
+            parent=root,
         )
         if new is not None:
             cur["price"] = new
@@ -452,7 +441,7 @@ def build_admin() -> None:
     def delete_row() -> None:
         sel = tree.selection()
         if not sel:
-            messagebox.showwarning("No selection", "Select one item first.", parent=root)
+            messagebox.showwarning("No selection", "Select an item first.", parent=root)
             return
         idx = int(sel[0]) - 1
         if messagebox.askyesno("Delete", f"Delete '{rows[idx]['name']}'?", parent=root):
@@ -464,41 +453,41 @@ def build_admin() -> None:
         ("✏️  Edit price", edit_price, "info"),
         ("➖ Delete item", delete_row, "danger"),
     ):
-        ttk.Button(panel, text=txt, width=20, bootstyle=sty, command=fn).pack(pady=4)
+        ttk.Button(panel, text=txt, width=20, bootstyle=sty,
+                   command=fn).pack(pady=4)
 
     ttk.Separator(panel).pack(fill=X, pady=8)
     ttk.Label(panel, text="Table ID:", font=("Segoe UI", 12)).pack()
-    ttk.Spinbox(panel, from_=1, to=100, textvariable=table_id_var, width=5, bootstyle="info").pack(pady=5)
+    ttk.Spinbox(panel, from_=1, to=100, textvariable=table_id_var,
+                width=5, bootstyle="info").pack(pady=5)
 
 
-# ─────────────────────── HISTORY TAB ─────────────────────────────
+# ─────────────────────── HISTORY TAB ────────────────────────────
 def build_history() -> None:
-    """Redraw the HISTORY tab."""
     f = history_frame
     for w in f.winfo_children():
         w.destroy()
 
-    # Filter Bar
     filt = ttk.LabelFrame(f, text="Filters", padding=10)
     filt.pack(fill=X, padx=10, pady=8)
     date_var, start_var, end_var = ttk.StringVar(), ttk.StringVar(), ttk.StringVar()
 
-    def _row(label: str, var: ttk.StringVar, col: int, width: int = 12) -> None:
+    def _row(label: str, var: ttk.StringVar, col: int, width: int = 12):
         ttk.Label(filt, text=label).grid(row=0, column=col, sticky=W, padx=4)
         ttk.Entry(filt, textvariable=var, width=width).grid(row=0, column=col + 1, pady=2)
 
     _row("Date (dd-mm-YYYY):", date_var, 0)
-    _row("Start (HH:MM):", start_var, 2, 8)
-    _row("End (HH:MM):", end_var, 4, 8)
-    ttk.Button(filt, text="🔍 Search", bootstyle="primary", command=lambda: load_rows()).grid(
-        row=0, column=6, padx=(10, 0)
-    )
+    _row("Start (HH:MM):",      start_var, 2, 8)
+    _row("End (HH:MM):",        end_var,   4, 8)
+    ttk.Button(filt, text="🔍 Search", bootstyle="primary",
+               command=lambda: load_rows()).grid(row=0, column=6, padx=(10, 0))
 
-    # Result Table
     lst = ttk.Frame(f)
     lst.pack(fill=BOTH, expand=True, padx=10, pady=(0, 10))
-    tree = ttk.Treeview(lst, columns=("Table", "Start", "End", "Date", "Total"), show="headings")
-    for h, w in zip(("Table", "Start", "End", "Date", "Total"), (50, 70, 70, 110, 120)):
+    tree = ttk.Treeview(lst, columns=("Table", "Start", "End", "Date", "Total"),
+                        show="headings")
+    for h, w in zip(("Table", "Start", "End", "Date", "Total"),
+                    (50, 70, 70, 110, 120)):
         tree.heading(h, text=h)
         tree.column(h, width=w, anchor=CENTER if h in ("Table", "Start", "End") else W)
     tree.pack(side=LEFT, fill=BOTH, expand=True)
@@ -511,7 +500,6 @@ def build_history() -> None:
 
     def load_rows() -> None:
         tree.delete(*tree.get_children())
-        # Parse user filters
         try:
             udate = dt.datetime.strptime(date_var.get(), "%d-%m-%Y").date() if date_var.get() else None
         except ValueError:
@@ -527,13 +515,9 @@ def build_history() -> None:
             meta = parse_bill_name(path.name)
             if not meta:
                 continue
-            d = dt.datetime.strptime(meta["date"], "%d-%m-%Y").date()
-            st = dt.datetime.strptime(meta["start"].replace("-", ":"), "%H:%M").time()
-            et = (
-                dt.datetime.strptime(meta["end"].replace("-", ":"), "%H:%M").time()
-                if meta["end"]
-                else st
-            )
+            d  = dt.datetime.strptime(meta["date"], "%d-%m-%Y").date()
+            st = dt.datetime.strptime(meta["start"].replace('-', ':'), "%H:%M").time()
+            et = dt.datetime.strptime(meta["end"].replace('-', ':'), "%H:%M").time() if meta["end"] else st
 
             def within(t1: dt.time, t2: dt.time) -> bool:
                 return abs(dt.datetime.combine(d, t1) - dt.datetime.combine(d, t2)) <= delta5
@@ -545,12 +529,9 @@ def build_history() -> None:
             if ue and not within(et, ue):
                 continue
 
-            tree.insert(
-                "",
-                "end",
-                iid=str(path),
-                values=(meta["table"], meta["start"], meta["end"] or "...", meta["date"], f"{bill_total(path):,.0f}"),
-            )
+            tree.insert("", "end", iid=str(path),
+                        values=(meta["table"], meta["start"], meta["end"] or "...",
+                                meta["date"], f"{bill_total(path):,.0f}"))
 
     load_rows()
 
@@ -561,12 +542,16 @@ def build_history() -> None:
         path = Path(sel[0])
         win = tk.Toplevel(root)
         win.title(path.name)
-        ttk.Label(win, text=path.name, font=("Segoe UI Semibold", 14)).pack(pady=(8, 4))
+        ttk.Label(win, text=path.name,
+                  font=("Segoe UI Semibold", 14)).pack(pady=(8, 4))
 
         tbl = ttk.Frame(win)
         tbl.pack(fill=BOTH, expand=True, padx=8, pady=8)
-        tv = ttk.Treeview(tbl, columns=("item", "qty", "unit", "line"), show="headings")
-        for cid, lbl, w in zip(("item", "qty", "unit", "line"), ("Item", "Qty", "Unit Price", "Line Total"), (200, 50, 100, 110)):
+        tv = ttk.Treeview(tbl, columns=("item", "qty", "unit", "line"),
+                          show="headings")
+        for cid, lbl, w in zip(("item", "qty", "unit", "line"),
+                               ("Item", "Qty", "Unit Price", "Line Total"),
+                               (200, 50, 100, 110)):
             tv.heading(cid, text=lbl)
             tv.column(cid, width=w, anchor=E if cid in ("unit", "line") else W)
         tv.pack(side=LEFT, fill=BOTH, expand=True)
@@ -574,24 +559,23 @@ def build_history() -> None:
 
         with open(path, newline="", encoding="utf-8") as fcsv:
             for r in csv.DictReader(fcsv):
-                tv.insert(
-                    "",
-                    "end",
-                    values=(r["item"], r["qty"], f"{float(r['unit_price']):,.0f}", f"{float(r['total_line']):,.0f}"),
-                )
-
-        ttk.Label(win, text=f"Total: {bill_total(path):,.0f} ₫", font=("Segoe UI Semibold", 12)).pack(pady=(0, 8))
+                tv.insert("", "end", values=(
+                    r["item"], r["qty"],
+                    f"{float(r['unit_price']):,.0f}",
+                    f"{float(r['total_line']):,.0f}"
+                ))
+        ttk.Label(win, text=f"Total: {bill_total(path):,.0f} ₫",
+                  font=("Segoe UI Semibold", 12)).pack(pady=(0, 8))
 
     tree.bind("<Double-1>", detail)
 
 
-# ───────────────── Tab-Change Event to Lazy-Refresh ──────────────
-nb.bind(
-    "<<NotebookTabChanged>>",
-    lambda e: {0: build_order, 1: build_admin, 2: build_history}.get(nb.index("current"), lambda: None)(),
-)
+# ─────────────────── Tab-change Lazy Redraw ──────────────────────
+nb.bind("<<NotebookTabChanged>>",
+        lambda e: {0: build_order, 1: build_admin, 2: build_history}
+        .get(nb.index("current"), lambda: None)())
 
-# ───────────────────── Initial Draw & Mainloop ───────────────────
+# ───────────────────────── Run UI ───────────────────────────────
 build_order()
 build_admin()
 build_history()
