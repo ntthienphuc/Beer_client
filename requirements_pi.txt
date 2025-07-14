@@ -1,0 +1,4 @@
+numpy>=1.26
+ttkbootstrap==1.*
+pillow
+tflite-runtime @ https://github.com/google-coral/pycoral/releases/download/release-frogfish/tflite_runtime-2.15.0-cp311-cp311-linux_aarch64.whl

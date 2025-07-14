@@ -1,0 +1,4 @@
+ttkbootstrap
+opencv-python
+numpy
+tensorflow          # đủ cả tf.lite
