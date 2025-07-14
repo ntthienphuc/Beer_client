@@ -15,6 +15,8 @@ try:
 except (ImportError, RuntimeError):
     ON_PI = False
 
+print("DEBUG ON_PI =", ON_PI)          # xem nhanh môi trường
+
 # ─── MODULE CỦA BẠN ───────────────────────────────────
 from models.inference import TFLiteModel
 from utils.csv_utils import (
@@ -24,13 +26,15 @@ from utils.csv_utils import (
 # from utils.tcp_client import send_bill               # mở khi cần
 
 # ─── LOGGING ──────────────────────────────────────────
+LOG_PATH = "/home/pi/sensor.log" if ON_PI else "sensor.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("sensor.log", encoding="utf-8"),
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
         logging.StreamHandler()
-    ]
+    ],
+    force=True           # ghi đè cấu hình cũ nếu có
 )
 logger = logging.getLogger("Sensor")
 
@@ -83,19 +87,20 @@ order_state = {"active": False}   # lưu thông tin phiên ORDER
 
 def sensor_loop(stop_evt):
     """Luồng nền: đợi cảm biến, chụp ảnh, predict, thêm món."""
+    logger.info("Sensor thread entered")
     if not ON_PI:
+        logger.warning("ON_PI False – sensor thread exiting")
         return
-    logger.info("Sensor thread started")
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(SENSOR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     try:
         while not stop_evt.is_set() and order_state.get("active"):
             if GPIO.input(SENSOR_PIN) == GPIO.HIGH:
-                logger.info("Object detected by sensor – capturing image")
+                logger.info("Object detected – capturing image")
                 os.system(CAP_CMD)
                 img = cv2.imread(IMAGE_PATH)
                 if img is None:
-                    logger.warning("Captured image not readable")
+                    logger.warning("Captured image unreadable")
                 else:
                     try:
                         name = model.predict(img)
@@ -105,13 +110,14 @@ def sensor_loop(stop_evt):
                         name = None
                     if name:
                         root.after(0, lambda n=name: add_item_threadsafe(n))
-                time.sleep(5)           # chống double-trigger
+                time.sleep(5)           # tránh ghi nhận liên tục
             time.sleep(0.1)
     finally:
         GPIO.cleanup()
         logger.info("Sensor thread stopped")
 
 def start_session():
+    print("DEBUG start_session CALLED")
     menu = load_menu()
     if not menu:
         messagebox.showwarning("Menu trống", "Bạn cần thêm món trước.")
@@ -141,11 +147,11 @@ def start_session():
                               daemon=True)
         order_state["thread"] = th
         th.start()
+        logger.info("Sensor thread created: %s", th)
 
     build_order()
 
 def finish_session():
-    # dừng sensor thread
     if order_state.get("thread"):
         order_state["stop_evt"].set()
         order_state["thread"].join(timeout=1)
@@ -300,7 +306,6 @@ def build_admin():
     with open(MENU_FILE, newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
             rows.append({"name": r["name"], "price": float(r["price"])})
-
     def refresh():
         tree.delete(*tree.get_children())
         for i, r in enumerate(rows, 1):
@@ -408,7 +413,6 @@ def build_history():
     add_tree_scroll(tree, tree_fr)
 
     delta5 = dt.timedelta(minutes=5)
-
     def _parse(t):
         return dt.datetime.strptime(t, "%H:%M").time() if t else None
 
